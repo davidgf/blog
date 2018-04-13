@@ -8,7 +8,7 @@ authors:
   - DavidGarcia
 ---
 
-Deployments in Serverless apps usually involves updating some of our Lambda functions, which is a one-step process where we replace our functions' code for new shiny versions. We build tests enough to be confident that we are not introducing any bug and we don't break anything. We even publish the update in different stages to check how it behaves in the cloud. However, a tingling runs down our spine every time we release to production, since we are not a 100% sure that we won't bump into an integration error or that we did not overlook any edge case. Fear no more, the [Canary Deployments Plugin](https://github.com/davidgf/serverless-plugin-canary-deployments) is your safety net.
+Deployments in Serverless apps usually involve updating some of our Lambda functions, which is a one-step process where we replace our functions' code for new shiny versions. We build tests enough to be confident that we are not introducing any bug and we don't break anything. We even publish the update in different stages to check how it behaves in the cloud. However, a tingling runs down our spine every time we release to production, since we are not a 100% sure that we won't bump into an integration error or that we did not overlook any edge case. Fear no more, the [Canary Deployments Plugin](https://github.com/davidgf/serverless-plugin-canary-deployments) is your safety net.
 
 ## Lambda Weighted Aliases + CodeDeploy = Peace of mind
 
@@ -117,7 +117,7 @@ Wait, it is Serverless v1.26.11!
 
 ### Make sure you don't break anything
 
-Now our function is not deployed in a single flip, woohoo! So what? If we have to ensure that the whole system is behaving correctly by ourselves, we didn't really achieve anything impressive. However, we can add yet another AWS service to the mix to avoid it: **CloudWatch Alarms**. We can provide CodeDeploy with a list of alarms that would be tracked during the deployment process, cancelling it and shifting all the traffic to the old version if any of them turns into `ALARM` state. In this example, we'll monitor that our function doesn't have any invocation error, for which we'll make use of [A Cloud Guru's Alerts Plugin](https://github.com/ACloudGuru/serverless-plugin-aws-alerts):
+Now our function is not deployed in a single flip, woohoo! So what? If we have to ensure that the whole system is behaving correctly by ourselves, we didn't really achieve anything impressive. However, we can add yet another AWS service to the mix to avoid it: **CloudWatch Alarms**. We can provide CodeDeploy with a list of alarms that would be tracked during the deployment process, canceling it and shifting all the traffic to the old version if any of them turns into `ALARM` state. In this example, we'll monitor that our function doesn't have any invocation error, for which we'll make use of [A Cloud Guru's Alerts Plugin](https://github.com/ACloudGuru/serverless-plugin-aws-alerts):
 
 ```yaml
 service: sls-canary-example
@@ -156,3 +156,110 @@ functions:
 ```
 
 The Canary Deployments plugin expects the logical ID of the CloudWatch alarms, which the Alerts plugin builds concatenating the function name, the alarm name and the string "Alarm" in Pascal case.
+
+### End-to-end testing
+
+By gradually deploying our function and being able to track CloudWatch metrics, we have all the tools we need to minimize the impact of a potential bug in our code. However, we could even avoid invoking a function version with errors by running **CodeDeploy Hooks** first. Hooks are simply Lambda functions triggered by CodeDeploy before and after traffic shifting takes place, and it expects to get notified about the success or failure of the hook, only continuing to the next step if it succeeded.  They are perfect for running end-to-end or integration tests and check that all the pieces fit together in the cloud, since it'll automatically roll back upon failure. This is how we can configure hooks:
+
+```yaml
+service: sls-canary-example
+
+provider:
+  name: aws
+  runtime: nodejs6.10
+  iamRoleStatements:
+    - Effect: Allow
+      Action:
+        - codedeploy:*
+      Resource:
+        - "*"
+
+plugins:
+  - serverless-plugin-aws-alerts
+  - serverless-plugin-canary-deployments
+
+custom:
+  alerts:
+    dashboards: true
+
+functions:
+  hello:
+    handler: handler.hello
+    events:
+      - http: get hello
+    alarms:
+      - name: foo
+        namespace: 'AWS/Lambda'
+        metric: Errors
+        threshold: 1
+        statistic: Minimum
+        period: 60
+        evaluationPeriods: 1
+        comparisonOperator: GreaterThanOrEqualToThreshold
+    deploymentSettings:
+      type: Linear10PercentEvery1Minute
+      alias: Live
+      preTrafficHook: preHook
+      postTrafficHook: postHook
+      alarms:
+        - HelloFooAlarm
+  preHook:
+    handler: hooks.pre
+  postHook:
+    handler: hooks.post
+```
+
+Notice that we need to grant our functions access to CodeDeploy, so that we can use [its SDK](https://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/CodeDeploy.html) in the hooks, which could look like this:
+
+```javascript
+const aws = require('aws-sdk');
+const codedeploy = new aws.CodeDeploy({apiVersion: '2014-10-06'});
+
+module.exports.pre = (event, context, callback) => {
+  var deploymentId = event.DeploymentId;
+  var lifecycleEventHookExecutionId = event.LifecycleEventHookExecutionId;
+
+  console.log('We are running some integration tests before we start shifting traffic...');
+
+  var params = {
+      deploymentId: deploymentId,
+      lifecycleEventHookExecutionId: lifecycleEventHookExecutionId,
+      status: 'Succeeded' // status can be 'Succeeded' or 'Failed'
+  };
+
+  return codedeploy.putLifecycleEventHookExecutionStatus(params).promise()
+    .then(data => callback(null, 'Validation test succeeded'))
+    .catch(err => callback('Validation test failed'));
+};
+
+module.exports.post = (event, context, callback) => {
+  var deploymentId = event.DeploymentId;
+  var lifecycleEventHookExecutionId = event.LifecycleEventHookExecutionId;
+
+  console.log('Check some stuff after traffic has been shifted...');
+
+  var params = {
+      deploymentId: deploymentId,
+      lifecycleEventHookExecutionId: lifecycleEventHookExecutionId,
+      status: 'Succeeded' // status can be 'Succeeded' or 'Failed'
+  };
+
+  return codedeploy.putLifecycleEventHookExecutionStatus(params).promise()
+    .then(data => callback(null, 'Validation test succeeded'))
+    .catch(err => callback('Validation test failed'));
+};
+```
+
+Hooks are suited for running test, but we could actually execute whatever we need to happen before or after our function deployment. We only have to keep in mind that we must notify CodeDeploy about the result of the hook, otherwise it'll assume that it failed if it doesn't get any response within one hour. (PRO Tip: we don't really need to notify CodeDeploy in the Lambda function hook, we could trigger some background job that runs anywhere else and report the result from there).
+
+## Conclusion
+
+CodeDeploy and Lambda Weighted Aliases take the deployment process of our Serverless functions to the next level, reducing the chances of releasing buggy code to the minimum and reacting automatically if anything goes wrong. Instead of publishing a new function version that gets all the invokations straight away, the deployment goes through different stages:
+
+1. The before traffic hook is executed.
+2. Traffic is shifted gradually to the new version and the provided CloudWatch alarms are monitored, canceling and rolling back if any of them is triggered.
+3. The after hook is executed.
+
+All those stages are executed in order and, if any of them fails, the deployment will be considered as failed and the whole system will roll back to the previous state. You can get the code of the example [here](https://github.com/davidgf/sls-canary-example), and if you're interested about the details of the underliying technology, check out this [post](https://hackernoon.com/canary-deployments-in-serverless-applications-b0f47fa9b409).
+
+Happy safe deployments!
